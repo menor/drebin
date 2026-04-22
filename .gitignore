@@ -1,0 +1,5 @@
+# Local notes — never committed
+*.local.md
+
+# macOS
+.DS_Store
