@@ -3,3 +3,36 @@
 
 # macOS
 .DS_Store
+
+# Dependencies
+node_modules/
+
+# Bun
+.bun/
+# bun.lockb
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Agent session data
+*.jsonl
+sessions/
