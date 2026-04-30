@@ -1,15 +1,104 @@
+import path from "node:path";
+
 const ICON = "👮🏻‍♂️ ";
 const ICON_ERROR = "🚨 ";
 const API_KEY = process.env.ANTHROPIC_API_KEY_FOR_DREBIN;
 const MODEL = "claude-opus-4-6";
 const MAX_TOKENS = 1024;
+// Hardcoded to the testing dir, so we don't mess outside of it for now
+const SANDBOX_ROOT = path.resolve("./sandbox/run");
 
-interface Message {
-  role: "user" | "assistant";
+type TextBlock = {
+  type: "text";
+  text: string;
+};
+
+type ToolUseBlock = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: unknown;
+};
+
+type ToolResultBlock = {
+  type: "tool_result";
+  tool_use_id: string;
   content: string;
+  is_error?: boolean;
+};
+
+type UserMessage = {
+  role: "user";
+  content: string | (TextBlock | ToolResultBlock)[];
+};
+
+type AssistantMessage = {
+  role: "assistant";
+  content: (TextBlock | ToolUseBlock)[];
+};
+
+type Message = UserMessage | AssistantMessage;
+
+type AssistantResponse = AssistantMessage & {
+  id: string;
+  stop_reason:
+    | "end_turn"
+    | "tool_use"
+    | "max_tokens"
+    | "stop_sequence"
+    | "refusal";
+};
+
+type ToolSchema = {
+  name: string;
+  description: string;
+  input_schema: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
+};
+
+type Tool = {
+  schema: ToolSchema;
+  handler: (input: any) => Promise<string>;
+};
+
+async function readFile(input: { path: string }): Promise<string> {
+  const resolved = path.resolve(input.path);
+  if (!resolved.startsWith(SANDBOX_ROOT + path.sep)) {
+    throw new Error(resolved + " is not an allowed path");
+  }
+  // TODO: not secure, use fs.realPath
+  const file = Bun.file(resolved);
+  return file.text();
 }
 
-async function request(messages: Message[]): Promise<string> {
+const toolRegistry: Record<string, Tool> = {
+  read_file: {
+    schema: {
+      name: "read_file",
+      description:
+        "returns file contents as a string, fails on missing files, expects a path relative to cwd or an absolute path",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "absolute or relative path ",
+          },
+        },
+        required: ["path"],
+      },
+    },
+    handler: readFile,
+  },
+};
+
+// we don't want to send the functions in handlers in our response
+const tools = Object.values(toolRegistry).map((t) => t.schema);
+
+async function request(messages: Message[]): Promise<AssistantMessage> {
   if (!API_KEY) {
     throw new Error("No ANTHROPIC_API_KEY_FOR_DREBIN found in the environment");
   }
@@ -25,6 +114,7 @@ async function request(messages: Message[]): Promise<string> {
       model: MODEL,
       max_tokens: MAX_TOKENS,
       messages,
+      tools,
     }),
   });
 
@@ -32,13 +122,54 @@ async function request(messages: Message[]): Promise<string> {
     throw new Error(`API: ${response.status}: ${await response.text()}`);
   }
 
-  const data = await response.json();
+  const data = (await response.json()) as AssistantResponse;
 
-  return data.content[0].text;
+  return {
+    role: "assistant",
+    content: data.content,
+  };
 }
 
 async function readUserInput(): Promise<string | undefined> {
   for await (const line of console) return line;
+}
+
+async function dispatch(toolUse: ToolUseBlock): Promise<ToolResultBlock> {
+  const tool = toolRegistry[toolUse.name];
+  if (!tool) {
+    return {
+      type: "tool_result",
+      tool_use_id: toolUse.id,
+      content: `Unknown tool: ${toolUse.name}`,
+      is_error: true,
+    };
+  }
+  if (typeof (toolUse.input as any).path !== "string") {
+    return {
+      type: "tool_result",
+      tool_use_id: toolUse.id,
+      content: "input.path missing or not a string",
+      is_error: true,
+    };
+  }
+
+  try {
+    const result: ToolResultBlock = {
+      type: "tool_result",
+      tool_use_id: toolUse.id,
+      content: await tool.handler(toolUse.input),
+      is_error: false,
+    };
+
+    return result;
+  } catch (err) {
+    return {
+      type: "tool_result",
+      tool_use_id: toolUse.id,
+      content: err instanceof Error ? err.message : "Unknown Error",
+      is_error: true,
+    };
+  }
 }
 
 async function main() {
@@ -49,14 +180,27 @@ async function main() {
     if (input === "/quit") {
       break;
     }
-    if (!input?.trim()) {
+    if (!input || !input.trim()) {
       continue;
     }
     try {
       messages.push({ role: "user", content: input });
-      const reply = await request(messages);
-      messages.push({ role: "assistant", content: reply });
-      console.log(reply);
+      while (true) {
+        const response = await request(messages);
+        messages.push(response);
+        for (const block of response.content) {
+          if (block.type === "text") {
+            console.log(block.text);
+          }
+        }
+        const toolUses = response.content.filter((b) => b.type === "tool_use");
+        if (toolUses.length === 0) {
+          break;
+        }
+        const results = await Promise.all(toolUses.map(dispatch));
+        messages.push({ role: "user", content: results });
+        console.log(messages);
+      }
     } catch (err) {
       messages.pop(); // we remove the last user message
       console.error(ICON_ERROR, err instanceof Error ? err.message : err);
