@@ -85,12 +85,31 @@ async function readFile(input: { path: string }): Promise<string> {
   return Bun.file(safe).text();
 }
 
-export async function listDir(input: { path: string }): Promise<string[]> {
+export async function listDir(input: { path: string }): Promise<string> {
   const safe = await resolveInSandbox(input.path);
-  return readdir(safe);
+  const entries = await readdir(safe, { withFileTypes: true });
+  return entries.map((x) => (x.isDirectory() ? x.name + "/" : x.name)).join("");
 }
 
 const toolRegistry: Record<string, Tool> = {
+  list_dir: {
+    schema: {
+      name: "list_dir",
+      description:
+        "lists the names of the files and dirs in a directory, directories end with a slash. expects a path inside the sandbox",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "absolute or relative directory path ",
+          },
+        },
+        required: ["path"],
+      },
+    },
+    handler: listDir,
+  },
   read_file: {
     schema: {
       name: "read_file",
