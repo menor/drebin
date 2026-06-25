@@ -88,7 +88,9 @@ async function readFile(input: { path: string }): Promise<string> {
 export async function listDir(input: { path: string }): Promise<string> {
   const safe = await resolveInSandbox(input.path);
   const entries = await readdir(safe, { withFileTypes: true });
-  return entries.map((x) => (x.isDirectory() ? x.name + "/" : x.name)).join("");
+  return entries
+    .map((x) => (x.isDirectory() ? x.name + "/" : x.name))
+    .join("\n");
 }
 
 const toolRegistry: Record<string, Tool> = {

@@ -39,8 +39,7 @@ afterAll(async () => {
 
 test("list_dir lists the entries in a sandbox directory", async () => {
   const out = await listDir({ path: listDirPath });
-  expect(out).toContain("a.txt");
-  expect(out).toContain("b.txt");
+  expect(out.split("\n").sort()).toEqual(["a.txt", "b.txt"]);
 });
 
 test("list_dir rejects a directory outside the sandbox", async () => {
