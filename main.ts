@@ -69,6 +69,10 @@ type Tool = {
 };
 
 export async function resolveInSandbox(inputPath: string): Promise<string> {
+  if (typeof inputPath !== "string") {
+    throw new Error("path must be a string");
+  }
+
   var resolved = await realpath(inputPath);
 
   if (
@@ -93,7 +97,56 @@ export async function listDir(input: { path: string }): Promise<string> {
     .join("\n");
 }
 
+export async function grep(input: {
+  pattern: string;
+  path: string;
+}): Promise<string> {
+  if (typeof input.pattern !== "string" || input.pattern === "") {
+    throw new Error("grep requires a non-empty string as a pattern");
+  }
+  const safe = await resolveInSandbox(input.path);
+  const text = await Bun.file(safe).text();
+  var re: RegExp;
+  try {
+    re = new RegExp(input.pattern);
+  } catch {
+    throw new Error(`Invalid regex pattern: ${input.pattern}`);
+  }
+
+  const hits = text
+    .replace(/\n$/, "")
+    .split("\n")
+    .map((line, i) => ({ line, n: i + 1 }))
+    .filter((row) => re.test(row.line))
+    .map((row) => `${row.n}:${row.line}`);
+  return hits.length ? hits.join("\n") : "(no matches)";
+}
+
 const toolRegistry: Record<string, Tool> = {
+  grep: {
+    schema: {
+      name: "grep",
+      description:
+        "searches a single file for lines matching a regex; returns 'lineNumber:line' per match, or '(no matches)'",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description:
+              "absolute or relative path of the file to search, must be inside the sandbox",
+          },
+          pattern: {
+            type: "string",
+            minLength: 1,
+            description: "a JavaScript regular expression",
+          },
+        },
+        required: ["path", "pattern"],
+      },
+    },
+    handler: grep,
+  },
   list_dir: {
     schema: {
       name: "list_dir",
@@ -178,14 +231,6 @@ async function dispatch(toolUse: ToolUseBlock): Promise<ToolResultBlock> {
       type: "tool_result",
       tool_use_id: toolUse.id,
       content: `Unknown tool: ${toolUse.name}`,
-      is_error: true,
-    };
-  }
-  if (typeof (toolUse.input as any).path !== "string") {
-    return {
-      type: "tool_result",
-      tool_use_id: toolUse.id,
-      content: "input.path missing or not a string",
       is_error: true,
     };
   }
