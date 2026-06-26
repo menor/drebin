@@ -70,3 +70,8 @@ test("grep rejects a file outside the sandbox", async () => {
 test("grep throws on an empty pattern (errors-as-data)", async () => {
   await expect(grep({ pattern: "", path: grepFile })).rejects.toThrow();
 });
+
+test("grep does not emit a phantom line for a trailing newline", async () => {
+  const out = await grep({ pattern: "^", path: grepFile });
+  expect(out.split("\n").length).toBe(2);
+});

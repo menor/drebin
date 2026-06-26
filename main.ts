@@ -69,6 +69,10 @@ type Tool = {
 };
 
 export async function resolveInSandbox(inputPath: string): Promise<string> {
+  if (typeof inputPath !== "string") {
+    throw new Error("path must be a string");
+  }
+
   var resolved = await realpath(inputPath);
 
   if (
@@ -102,9 +106,15 @@ export async function grep(input: {
   }
   const safe = await resolveInSandbox(input.path);
   const text = await Bun.file(safe).text();
-  const re = new RegExp(input.pattern);
+  var re: RegExp;
+  try {
+    re = new RegExp(input.pattern);
+  } catch {
+    throw new Error(`Invalid regex pattern: ${input.pattern}`);
+  }
 
   const hits = text
+    .replace(/\n$/, "")
     .split("\n")
     .map((line, i) => ({ line, n: i + 1 }))
     .filter((row) => re.test(row.line))
@@ -128,6 +138,7 @@ const toolRegistry: Record<string, Tool> = {
           },
           pattern: {
             type: "string",
+            minLength: 1,
             description: "a JavaScript regular expression",
           },
         },
