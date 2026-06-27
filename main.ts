@@ -1,6 +1,24 @@
 import { mkdir, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 
+const SESSIONS_DIR = path.resolve("./.sessions");
+await mkdir(SESSIONS_DIR, { recursive: true });
+
+function sessionPath(id: string) {
+  return path.join(SESSIONS_DIR, id + ".jsonl");
+}
+
+async function persist(sink: Bun.FileSink, messages: Message[], from: number) {
+  const lines = messages
+    .slice(from)
+    .map((m) => JSON.stringify(m) + "\n")
+    .join("");
+  if (lines) {
+    await sink.write(lines);
+  }
+  sink.flush();
+}
+
 // Hardcoded to the testing dir, so we don't mess outside of it for now
 const sandboxPath = path.resolve("./sandbox/run");
 await mkdir(sandboxPath, { recursive: true });
@@ -33,7 +51,7 @@ type ToolResultBlock = {
 
 type UserMessage = {
   role: "user";
-  content: string | (TextBlock | ToolResultBlock)[];
+  content: (TextBlock | ToolResultBlock)[];
 };
 
 type AssistantMessage = {
@@ -279,7 +297,6 @@ export async function runStep(state: AgentState): Promise<AgentState> {
 
 function render(messages: Message[], from: number) {
   for (const msg of messages.slice(from)) {
-    if (!Array.isArray(msg.content)) continue; // The human input is never an array so this avoids us to echo it
     for (const block of msg.content) {
       if (block.type === "text") console.log(block.text);
       if (block.type === "tool_use")
@@ -295,6 +312,11 @@ async function main() {
     messages: [],
     status: "idle",
   };
+  const sessionId = crypto.randomUUID();
+  console.log(`${ICON}session ${sessionId}`);
+  const file = Bun.file(sessionPath(sessionId));
+  const sink = file.writer();
+
   while (true) {
     process.stdout.write(ICON);
     const input = await readUserInput();
@@ -307,7 +329,10 @@ async function main() {
 
     const turnStart = state.messages.length; // roll-back point if the API call fails
     state = {
-      messages: [...state.messages, { role: "user", content: input }],
+      messages: [
+        ...state.messages,
+        { role: "user", content: [{ type: "text", text: input }] },
+      ],
       status: "thinking",
     };
 
@@ -323,8 +348,10 @@ async function main() {
       console.error(ICON_ERROR, err instanceof Error ? err.message : err);
       continue;
     }
+    await persist(sink, state.messages, turnStart);
     state = { ...state, status: "idle" };
   }
+  sink.end();
 }
 
 if (import.meta.main) {

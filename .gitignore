@@ -35,7 +35,7 @@ yarn-error.log*
 
 # Agent session data
 *.jsonl
-sessions/
+.sessions/
 
 # Test sandbox
 sandbox/
