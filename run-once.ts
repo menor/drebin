@@ -5,7 +5,7 @@ const prompt =
   process.argv[2] ?? "List the files in ./sandbox/run and summarise them.";
 
 let state: AgentState = {
-  messages: [{ role: "user", content: prompt }],
+  messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
   status: "thinking",
 };
 

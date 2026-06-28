@@ -1,28 +1,43 @@
+import { createWriteStream, WriteStream } from "node:fs";
 import { mkdir, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 
 const SESSIONS_DIR = path.resolve("./.sessions");
-await mkdir(SESSIONS_DIR, { recursive: true });
 
 function sessionPath(id: string) {
   return path.join(SESSIONS_DIR, id + ".jsonl");
 }
 
-async function persist(sink: Bun.FileSink, messages: Message[], from: number) {
+async function persist(sink: WriteStream, messages: Message[], from: number) {
   const lines = messages
     .slice(from)
     .map((m) => JSON.stringify(m) + "\n")
     .join("");
   if (lines) {
-    await sink.write(lines);
+    sink.write(lines);
   }
-  sink.flush();
 }
 
-// Hardcoded to the testing dir, so we don't mess outside of it for now
+async function loadSession(id: string): Promise<Message[]> {
+  const text = await Bun.file(sessionPath(id)).text();
+  return text
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as Message);
+}
+
+// Hardcoded to the testing dir, so we don't mess outside of it for now.
+// Lazily resolved on first tool use so importing this module has no side effects.
 const sandboxPath = path.resolve("./sandbox/run");
-await mkdir(sandboxPath, { recursive: true });
-const SANDBOX_ROOT = await realpath(sandboxPath);
+let sandboxRoot: string | undefined;
+
+async function getSandboxRoot(): Promise<string> {
+  if (!sandboxRoot) {
+    await mkdir(sandboxPath, { recursive: true });
+    sandboxRoot = await realpath(sandboxPath);
+  }
+  return sandboxRoot;
+}
 
 const ICON = "👮🏻‍♂️ ";
 const ICON_ERROR = "🚨 ";
@@ -98,11 +113,12 @@ export async function resolveInSandbox(inputPath: string): Promise<string> {
     throw new Error("path must be a string");
   }
 
+  const root = await getSandboxRoot();
   var resolved = await realpath(inputPath);
 
   if (
-    resolved !== SANDBOX_ROOT &&
-    !resolved.startsWith(SANDBOX_ROOT + path.sep)
+    resolved !== root &&
+    !resolved.startsWith(root + path.sep)
   ) {
     throw new Error(resolved + " resolves outside the sandbox");
   }
@@ -308,14 +324,35 @@ function render(messages: Message[], from: number) {
 }
 
 async function main() {
-  let state: AgentState = {
-    messages: [],
-    status: "idle",
-  };
-  const sessionId = crypto.randomUUID();
+  const resumeFlag = process.argv.includes("--resume");
+  const resumeId = resumeFlag
+    ? process.argv[process.argv.indexOf("--resume") + 1]
+    : undefined;
+
+  if (resumeFlag && !resumeId) {
+    throw new Error("--resume needs a session id to resume");
+  }
+
+  let state: AgentState = resumeId
+    ? {
+        messages: await loadSession(resumeId),
+        status: "idle",
+      }
+    : {
+        messages: [],
+        status: "idle",
+      };
+
+  const sessionId = resumeId ?? crypto.randomUUID();
   console.log(`${ICON}session ${sessionId}`);
-  const file = Bun.file(sessionPath(sessionId));
-  const sink = file.writer();
+
+  if (resumeId) {
+    console.log(`resumed with ${state.messages.length} messages.`);
+  }
+
+  await mkdir(SESSIONS_DIR, { recursive: true });
+  // "a" flag appends, so resuming keeps the existing log intact
+  const sink = createWriteStream(sessionPath(sessionId), { flags: "a" });
 
   while (true) {
     process.stdout.write(ICON);
