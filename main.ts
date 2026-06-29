@@ -2,6 +2,20 @@ import { createWriteStream, WriteStream } from "node:fs";
 import { mkdir, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 
+const TOOL_ERROR = Symbol("toolError");
+
+type ErrorCode = "outside_sandbox" | "not_found" | "bad_pattern" | "bad_input";
+
+function toolError(code: ErrorCode, message: string, hint: string) {
+  return Object.assign(new Error(message), { [TOOL_ERROR]: true, code, hint });
+}
+
+function isToolError(
+  e: unknown,
+): e is Error & { code: ErrorCode; hint: string } {
+  return e instanceof Error && TOOL_ERROR in e;
+}
+
 const SESSIONS_DIR = path.resolve("./.sessions");
 
 function sessionPath(id: string) {
@@ -28,7 +42,8 @@ async function loadSession(id: string): Promise<Message[]> {
 
 // Hardcoded to the testing dir, so we don't mess outside of it for now.
 // Lazily resolved on first tool use so importing this module has no side effects.
-const sandboxPath = path.resolve("./sandbox/run");
+const SANDBOX_DIR = "./sandbox/run";
+const sandboxPath = path.resolve(SANDBOX_DIR);
 let sandboxRoot: string | undefined;
 
 async function getSandboxRoot(): Promise<string> {
@@ -110,17 +125,48 @@ export type AgentState = {
 
 export async function resolveInSandbox(inputPath: string): Promise<string> {
   if (typeof inputPath !== "string") {
-    throw new Error("path must be a string");
+    throw toolError(
+      "bad_input",
+      "path must be a string",
+      `Pass a path as a string inside ${SANDBOX_DIR}.`,
+    );
   }
 
   const root = await getSandboxRoot();
-  var resolved = await realpath(inputPath);
 
-  if (
-    resolved !== root &&
-    !resolved.startsWith(root + path.sep)
-  ) {
-    throw new Error(resolved + " resolves outside the sandbox");
+  // 1. Lexical boundary check FIRST — no disk, never throws on missing.
+  //    This gives `outside_sandbox` its hint even when the path doesn't exist.
+  const lexical = path.resolve(root, inputPath);
+  if (lexical !== root && !lexical.startsWith(root + path.sep)) {
+    throw toolError(
+      "outside_sandbox",
+      `${lexical} resolves outside the sandbox`,
+      `Pass a path inside ${SANDBOX_DIR}; relative paths resolve from there.`,
+    );
+  }
+
+  // 2. Canonicalize to defeat symlink escape — but convert "missing" to not_found.
+  let resolved: string;
+  try {
+    resolved = await realpath(lexical);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+      throw toolError(
+        "not_found",
+        `${inputPath} does not exist`,
+        "Use list_dir to see what's in the sandbox.",
+      );
+    }
+    throw e; // unexpected fs error → not anticipated → let it surface loudly
+  }
+
+  // 3. Re-check AFTER symlink resolution — a symlink inside could point outside.
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw toolError(
+      "outside_sandbox",
+      `${resolved} resolves outside the sandbox`,
+      `Symlinks may not escape ${SANDBOX_DIR}.`,
+    );
   }
   return resolved;
 }
@@ -143,15 +189,23 @@ export async function grep(input: {
   path: string;
 }): Promise<string> {
   if (typeof input.pattern !== "string" || input.pattern === "") {
-    throw new Error("grep requires a non-empty string as a pattern");
+    throw toolError(
+      "bad_input",
+      "grep requires a non-empty pattern",
+      "Pass a non-empty regex string as `pattern`.",
+    );
   }
   const safe = await resolveInSandbox(input.path);
   const text = await Bun.file(safe).text();
-  var re: RegExp;
+  let re: RegExp;
   try {
     re = new RegExp(input.pattern);
   } catch {
-    throw new Error(`Invalid regex pattern: ${input.pattern}`);
+    throw toolError(
+      "bad_pattern",
+      `Invalid regex: ${input.pattern}`,
+      "Escape special characters or simplify the pattern.",
+    );
   }
 
   const hits = text
@@ -261,10 +315,6 @@ async function request(messages: Message[]): Promise<AssistantMessage> {
   };
 }
 
-async function readUserInput(): Promise<string | undefined> {
-  for await (const line of console) return line;
-}
-
 async function dispatch(toolUse: ToolUseBlock): Promise<ToolResultBlock> {
   const tool = toolRegistry[toolUse.name];
   if (!tool) {
@@ -286,12 +336,19 @@ async function dispatch(toolUse: ToolUseBlock): Promise<ToolResultBlock> {
 
     return result;
   } catch (err) {
-    return {
-      type: "tool_result",
-      tool_use_id: toolUse.id,
-      content: err instanceof Error ? err.message : "Unknown Error",
-      is_error: true,
-    };
+    if (isToolError(err)) {
+      return {
+        type: "tool_result",
+        tool_use_id: toolUse.id,
+        content: JSON.stringify({
+          code: err.code,
+          message: err.message,
+          hint: err.hint,
+        }),
+        is_error: true,
+      };
+    }
+    throw err; // programmer error, DON'T feed it to the model, let it crash
   }
 }
 
@@ -353,14 +410,16 @@ async function main() {
   await mkdir(SESSIONS_DIR, { recursive: true });
   // "a" flag appends, so resuming keeps the existing log intact
   const sink = createWriteStream(sessionPath(sessionId), { flags: "a" });
-
-  while (true) {
-    process.stdout.write(ICON);
-    const input = await readUserInput();
+  // Single line iterator for the whole session (idiomatic Bun stdin read).
+  // Prompt before the loop, then once after each turn — no dangling icons.
+  process.stdout.write(ICON);
+  for await (const line of console) {
+    const input = line.trim();
     if (input === "/quit") {
       break;
     }
-    if (!input || !input.trim()) {
+    if (!input) {
+      process.stdout.write(ICON);
       continue;
     }
 
@@ -381,12 +440,13 @@ async function main() {
         shown = state.messages.length;
       }
     } catch (err) {
-      state = { messages: state.messages.slice(0, turnStart), status: "idle" }; // drop failed turn
+      // drop failed turn; the rolled-back slice means persist() below writes nothing
+      state = { messages: state.messages.slice(0, turnStart), status: "idle" };
       console.error(ICON_ERROR, err instanceof Error ? err.message : err);
-      continue;
     }
     await persist(sink, state.messages, turnStart);
     state = { ...state, status: "idle" };
+    process.stdout.write(ICON);
   }
   sink.end();
 }
