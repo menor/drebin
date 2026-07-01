@@ -2,63 +2,23 @@ import { createWriteStream, WriteStream } from "node:fs";
 import { mkdir, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 
-const TOOL_ERROR = Symbol("toolError");
-
-type ErrorCode = "outside_sandbox" | "not_found" | "bad_pattern" | "bad_input";
-
-function toolError(code: ErrorCode, message: string, hint: string) {
-  return Object.assign(new Error(message), { [TOOL_ERROR]: true, code, hint });
-}
-
-function isToolError(
-  e: unknown,
-): e is Error & { code: ErrorCode; hint: string } {
-  return e instanceof Error && TOOL_ERROR in e;
-}
-
-const SESSIONS_DIR = path.resolve("./.sessions");
-
-function sessionPath(id: string) {
-  return path.join(SESSIONS_DIR, id + ".jsonl");
-}
-
-async function persist(sink: WriteStream, messages: Message[], from: number) {
-  const lines = messages
-    .slice(from)
-    .map((m) => JSON.stringify(m) + "\n")
-    .join("");
-  if (lines) {
-    sink.write(lines);
-  }
-}
-
-async function loadSession(id: string): Promise<Message[]> {
-  const text = await Bun.file(sessionPath(id)).text();
-  return text
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .map((line) => JSON.parse(line) as Message);
-}
-
-// Hardcoded to the testing dir, so we don't mess outside of it for now.
-// Lazily resolved on first tool use so importing this module has no side effects.
-const SANDBOX_DIR = "./sandbox/run";
-const sandboxPath = path.resolve(SANDBOX_DIR);
-let sandboxRoot: string | undefined;
-
-async function getSandboxRoot(): Promise<string> {
-  if (!sandboxRoot) {
-    await mkdir(sandboxPath, { recursive: true });
-    sandboxRoot = await realpath(sandboxPath);
-  }
-  return sandboxRoot;
-}
+// ============================================================================
+// CONFIG
+// ============================================================================
 
 const ICON = "👮🏻‍♂️ ";
 const ICON_ERROR = "🚨 ";
 const API_KEY = process.env.ANTHROPIC_API_KEY_FOR_DREBIN;
 const MODEL = "claude-opus-4-6";
 const MAX_TOKENS = 1024;
+
+// Hardcoded to the testing dir, so we don't mess outside of it for now.
+const SANDBOX_DIR = "./sandbox/run";
+const SESSIONS_DIR = path.resolve("./.sessions");
+
+// ============================================================================
+// TYPES
+// ============================================================================
 
 type TextBlock = {
   type: "text";
@@ -114,14 +74,49 @@ type ToolSchema = {
 type Tool = {
   schema: ToolSchema;
   handler: (input: any) => Promise<string>;
+  needsApproval?: boolean; // Is not sent to the model, so this lives outside the schema
 };
 
-type AgentStatus = "idle" | "thinking" | "done";
+type AgentStatus = "awaiting_approval" | "idle" | "thinking" | "done";
 
 export type AgentState = {
   messages: Message[];
   status: AgentStatus;
 };
+
+// ============================================================================
+// ERRORS
+// ============================================================================
+
+const TOOL_ERROR = Symbol("toolError");
+
+type ErrorCode = "outside_sandbox" | "not_found" | "bad_pattern" | "bad_input";
+
+function toolError(code: ErrorCode, message: string, hint: string) {
+  return Object.assign(new Error(message), { [TOOL_ERROR]: true, code, hint });
+}
+
+function isToolError(
+  e: unknown,
+): e is Error & { code: ErrorCode; hint: string } {
+  return e instanceof Error && TOOL_ERROR in e;
+}
+
+// ============================================================================
+// SANDBOX
+// ============================================================================
+
+// Lazily resolved on first tool use so importing this module has no side effects.
+const sandboxPath = path.resolve(SANDBOX_DIR);
+let sandboxRoot: string | undefined;
+
+async function getSandboxRoot(): Promise<string> {
+  if (!sandboxRoot) {
+    await mkdir(sandboxPath, { recursive: true });
+    sandboxRoot = await realpath(sandboxPath);
+  }
+  return sandboxRoot;
+}
 
 export async function resolveInSandbox(inputPath: string): Promise<string> {
   if (typeof inputPath !== "string") {
@@ -170,6 +165,10 @@ export async function resolveInSandbox(inputPath: string): Promise<string> {
   }
   return resolved;
 }
+
+// ============================================================================
+// TOOLS
+// ============================================================================
 
 async function readFile(input: { path: string }): Promise<string> {
   const safe = await resolveInSandbox(input.path);
@@ -283,6 +282,10 @@ const toolRegistry: Record<string, Tool> = {
 // we don't want to send the functions in handlers in our response
 const tools = Object.values(toolRegistry).map((t) => t.schema);
 
+// ============================================================================
+// MODEL
+// ============================================================================
+
 async function request(messages: Message[]): Promise<AssistantMessage> {
   if (!API_KEY) {
     throw new Error("No ANTHROPIC_API_KEY_FOR_DREBIN found in the environment");
@@ -314,6 +317,10 @@ async function request(messages: Message[]): Promise<AssistantMessage> {
     content: data.content,
   };
 }
+
+// ============================================================================
+// CORE — state-in/state-out engine, transport-agnostic
+// ============================================================================
 
 async function dispatch(toolUse: ToolUseBlock): Promise<ToolResultBlock> {
   const tool = toolRegistry[toolUse.name];
@@ -361,12 +368,74 @@ export async function runStep(state: AgentState): Promise<AgentState> {
     return { messages, status: "done" };
   }
 
+  if (toolUses.some((u) => toolRegistry[u.name]?.needsApproval)) {
+    return { messages, status: "awaiting_approval" };
+  }
+
   const results = await Promise.all(toolUses.map(dispatch));
   return {
     messages: [...messages, { role: "user", content: results }],
     status: "thinking",
   };
 }
+
+export async function resumeAfterApproval(
+  state: AgentState,
+  approved: boolean,
+): Promise<AgentState> {
+  const last = state.messages.at(-1);
+  if (!last) throw new Error("resumeAfterApproval called with no messages");
+
+  const toolUses = last.content.filter((b) => b.type === "tool_use");
+
+  const results: ToolResultBlock[] = approved
+    ? await Promise.all(toolUses.map(dispatch))
+    : toolUses.map((u) => ({
+        type: "tool_result",
+        tool_use_id: u.id,
+        content: JSON.stringify({
+          code: "denied",
+          message: "A user declined this action",
+          hint: "Do not retry it; explain or take a different approach.",
+        }),
+        is_error: true,
+      }));
+
+  return {
+    messages: [...state.messages, { role: "user", content: results }],
+    status: "thinking",
+  };
+}
+
+// ============================================================================
+// PERSISTENCE
+// ============================================================================
+
+function sessionPath(id: string) {
+  return path.join(SESSIONS_DIR, id + ".jsonl");
+}
+
+async function persist(sink: WriteStream, messages: Message[], from: number) {
+  const lines = messages
+    .slice(from)
+    .map((m) => JSON.stringify(m) + "\n")
+    .join("");
+  if (lines) {
+    sink.write(lines);
+  }
+}
+
+async function loadSession(id: string): Promise<Message[]> {
+  const text = await Bun.file(sessionPath(id)).text();
+  return text
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as Message);
+}
+
+// ============================================================================
+// VIEW — the only I/O lives here
+// ============================================================================
 
 function render(messages: Message[], from: number) {
   for (const msg of messages.slice(from)) {
@@ -378,6 +447,19 @@ function render(messages: Message[], from: number) {
         console.log(`   ${block.is_error ? ICON_ERROR : "✓"} ${block.content}`);
     }
   }
+}
+
+async function drive(
+  state: AgentState,
+  shownFrom: number,
+): Promise<AgentState> {
+  let shown = shownFrom;
+  while (state.status === "thinking") {
+    state = await runStep(state);
+    render(state.messages, shown);
+    shown = state.messages.length;
+  }
+  return state; // done or awaiting_approval
 }
 
 async function main() {
@@ -415,38 +497,43 @@ async function main() {
   process.stdout.write(ICON);
   for await (const line of console) {
     const input = line.trim();
-    if (input === "/quit") {
-      break;
-    }
-    if (!input) {
-      process.stdout.write(ICON);
-      continue;
-    }
+    let from: number;
 
-    const turnStart = state.messages.length; // roll-back point if the API call fails
-    state = {
-      messages: [
-        ...state.messages,
-        { role: "user", content: [{ type: "text", text: input }] },
-      ],
-      status: "thinking",
-    };
+    if (state.status === "awaiting_approval") {
+      from = state.messages.length; // tool_use is already persisted
+      state = await resumeAfterApproval(state, input.toLowerCase() === "y");
+    } else {
+      if (input === "/quit") {
+        break;
+      }
+      if (!input) {
+        process.stdout.write(ICON);
+        continue;
+      }
+      from = state.messages.length;
+      state = {
+        messages: [
+          ...state.messages,
+          { role: "user", content: [{ type: "text", text: input }] },
+        ],
+        status: "thinking",
+      };
+    }
 
     try {
-      let shown = state.messages.length;
-      while (state.status === "thinking") {
-        state = await runStep(state);
-        render(state.messages, shown);
-        shown = state.messages.length;
-      }
+      state = await drive(state, from);
     } catch (err) {
       // drop failed turn; the rolled-back slice means persist() below writes nothing
-      state = { messages: state.messages.slice(0, turnStart), status: "idle" };
+      state = { messages: state.messages.slice(0, from), status: "idle" };
       console.error(ICON_ERROR, err instanceof Error ? err.message : err);
     }
-    await persist(sink, state.messages, turnStart);
-    state = { ...state, status: "idle" };
-    process.stdout.write(ICON);
+    await persist(sink, state.messages, from);
+    if (state.status === "awaiting_approval") {
+      process.stdout.write("\n Approve? (y/n) ");
+    } else {
+      state = { ...state, status: "idle" };
+      process.stdout.write(ICON);
+    }
   }
   sink.end();
 }
